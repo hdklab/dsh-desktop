@@ -386,6 +386,23 @@ describe('GitHub release contract', () => {
     expect(developmentConfig.nsis.artifactName).toBe('dsh-desktop-dev-windows-${arch}-setup.${ext}')
   })
 
+  it('builds the Linux AppImage with a static runtime instead of the FUSE2 toolset', async () => {
+    // electron-builder 26 defaults to toolsets.appimage = '0.0.0', whose runtime
+    // dlopen()s libfuse.so.2. Ubuntu 24.04+/26.04, Debian 13 and Fedora 41+ only
+    // ship FUSE3, so the default toolset produces an AppImage that aborts with
+    // "dlopen(): error loading libfuse.so.2" on those hosts. Anything >= 1.0.0
+    // embeds a static runtime, so guard the choice rather than the exact value.
+    const linuxConfig = createRequire(import.meta.url)('../electron-builder.linux.cjs') as {
+      toolsets?: { appimage?: string }
+      linux: { target: { target: string; arch: string[] }[] }
+    }
+
+    expect(linuxConfig.linux.target).toEqual([{ target: 'AppImage', arch: ['x64'] }])
+    const appImageToolset = linuxConfig.toolsets?.appimage
+    expect(appImageToolset).toBeDefined()
+    expect(Number(appImageToolset?.split('.')[0] ?? '0')).toBeGreaterThanOrEqual(1)
+  })
+
   it('builds and publishes every supported platform', async () => {
     const workflow = await readFile(
       path.join(projectRoot, '.github', 'workflows', 'release.yml'),
