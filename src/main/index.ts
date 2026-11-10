@@ -1,3 +1,4 @@
+import { HarnessBootFailures } from './harness-boot-failures'
 import { isMemoryExit } from './resource-diagnostics'
 import { ProcessRecovery } from './process-recovery'
 import { ApplicationRollbackFlow } from './application-rollback-flow'
@@ -36,9 +37,10 @@ import {
   type MessageBoxOptions
 } from 'electron'
 import { HarnessShell } from './harness-shell'
-import { HARNESS_SHELL_URL, HARNESS_BOOT_CHANNEL, HARNESS_BOOT_FAILED_CHANNEL, isHarnessShellUrl, isHarnessBootPage } from '../shared/harness-boot'
+import { HARNESS_SHELL_URL, HARNESS_BOOT_DOCUMENT_CHANNEL, HARNESS_BOOT_CHANNEL, HARNESS_BOOT_FAILED_CHANNEL, isHarnessShellUrl, isHarnessBootPage } from '../shared/harness-boot'
 import {
   DEFAULT_HARNESS_PORT,
+  extractDuplicateAgentPresetId,
   extractFailureCause,
   extractPluginFailureReferences,
   HarnessRuntime,
@@ -102,6 +104,8 @@ import {
   serializeGpuFallbackState
 } from './gpu-fallback'
 import { secureWindow } from './security'
+import { SidebarBrowserGuests } from './sidebar-browser'
+import { SIDEBAR_BROWSER_IPC } from '../shared/sidebar-browser'
 import { SafeModeFrame } from './safe-mode-frame'
 import { desktopResourceUrl, installDesktopProtocol, registerDesktopScheme, SAFE_MODE_PAGE } from './desktop-protocol'
 import { ensureLaunchRoot } from './state/launch-root'
@@ -113,7 +117,7 @@ import {
   pruneUnresolvableProfileBundles
 } from './state/plugin-recovery'
 import { ensureSafeModeProfile, SAFE_MODE_PROFILE } from './state/safe-mode-profile'
-import { migrateLegacyAgentPresets } from './state/legacy-preset-migration'
+import { disableMigratedLegacyPreset, migrateLegacyAgentPresets } from './state/legacy-preset-migration'
 import { WindowStateManager } from './state/window-state'
 import {
   isProjectedGenerationPlugin,
@@ -248,6 +252,7 @@ let mainWindow: BrowserWindow | undefined
 let mobileWindow: BrowserWindow | undefined
 let tray: Tray | undefined
 let runtime: HarnessRuntime
+const harnessBootFailures = new HarnessBootFailures()
 let harnessShell: HarnessShell
 let harnessPagePreparation: Promise<boolean> | undefined
 let desktopStorageManager: DesktopStorageManager | undefined
@@ -286,6 +291,8 @@ let webImportActionResolver: ((action: WebImportAction) => void) | undefined
 let mainWindowNavigationVersion = 0
 let rendererPluginFailureLogs: string[] = []
 let pluginRecoveryRemovedPlugins: string[] = []
+/** Migrated preset rows auto-disabled because a plugin registers the same id at runtime. */
+let autoDisabledPresetIds = new Set<string>()
 /** Plugins a deferred migration has not moved yet; their legacy copies may be manifest-only. */
 let migrationPendingPlugins = new Set<string>()
 let pluginRecoveryResetTimer: ReturnType<typeof setTimeout> | undefined
@@ -1110,6 +1117,8 @@ function ensureTray(): void {
   tray.on('click', restoreMainWindow)
 }
 
+const sidebarBrowser = new SidebarBrowserGuests(() => runtime.snapshot().url)
+
 function createWindow(): BrowserWindow {
   const isWindows = process.platform === 'win32'
   windowStateManager ??= new WindowStateManager(app.getPath('userData'))
@@ -1122,7 +1131,7 @@ function createWindow(): BrowserWindow {
     minWidth: 900,
     minHeight: 640,
     show: false,
-    title: '',
+    title: app.getName(),
     icon: desktopIconPath(),
     ...(process.platform === 'darwin' ? {
       titleBarStyle: 'hiddenInset' as const,
@@ -1142,6 +1151,7 @@ function createWindow(): BrowserWindow {
       contextIsolation: true,
       nodeIntegration: false,
       preload: join(import.meta.dirname, '../preload/index.cjs'),
+      webviewTag: true,
       sandbox: true,
       webSecurity: true
     }
@@ -1180,7 +1190,7 @@ function createWindow(): BrowserWindow {
   })
   window.on('page-title-updated', (event) => {
     event.preventDefault()
-    window.setTitle('')
+    window.setTitle(app.getName())
   })
   window.webContents.on('console-message', (details) => {
     if (details.level !== 'error') return
@@ -1189,7 +1199,8 @@ function createWindow(): BrowserWindow {
     appendRendererPluginFailureLog(details.message)
   })
   installPluginRecoveryNavigation(window)
-  secureWindow(window)
+  sidebarBrowser.bind(window)
+  secureWindow(window, true, true)
   installContextMenu(window, harnessLocale)
   installMainWindowRendererRecovery(window)
   window.on('closed', () => {
@@ -2292,6 +2303,19 @@ async function showPluginRecovery(options?: {
         timeoutMs: waitForRendererEvidence ? PLUGIN_RECOVERY_EVIDENCE_TIMEOUT_MS : 0
       })
       if (!developmentDemoUnknown) detection.plugins = evidence.targets(detection.plugins, removedPlugins)
+
+      // A preset the user's plugin registers at runtime can also live as a row the
+      // legacy migration generated; the duplicate id aborts startup and the row
+      // regenerates nothing only if it stays present. Disable that one row and
+      // relaunch: the plugin's own registration keeps the preset alive (#814).
+      const duplicatePresetId = extractDuplicateAgentPresetId(detection.logs)
+      if (duplicatePresetId && !autoDisabledPresetIds.has(duplicatePresetId)) {
+        if (await disableMigratedLegacyPreset(dshHome, duplicatePresetId, (line) => runtime.note(line))) {
+          autoDisabledPresetIds.add(duplicatePresetId)
+          await launchWithFreshEvidence()
+          continue
+        }
+      }
       // A plugin the deferred migration left manifest-only is not broken; removing
       // it would delete a working plugin because of an install-time failure. A
       // pending plugin whose legacy copy is installed can still be the culprit.
@@ -3563,6 +3587,11 @@ async function bootstrap(): Promise<void> {
     }
   )
   registerHarnessHandlers()
+  ipcMain.handle(HARNESS_BOOT_DOCUMENT_CHANNEL, (event, documentId: unknown) => {
+    assertTrustedMainWindowEvent(event)
+    if (!isHarnessShellUrl(event.sender.getURL())) throw new Error('The Harness shell is not active.')
+    harnessBootFailures.bind(documentId, mainWindowNavigationVersion)
+  })
   ipcMain.handle(HARNESS_BOOT_CHANNEL, async event => {
     assertTrustedMainWindowEvent(event)
     if (!isHarnessShellUrl(event.sender.getURL())) throw new Error('The Harness shell is not active.')
@@ -3574,10 +3603,14 @@ async function bootstrap(): Promise<void> {
     }
     return payload
   })
-  ipcMain.handle(HARNESS_BOOT_FAILED_CHANNEL, (event, message: unknown) => {
+  ipcMain.handle(HARNESS_BOOT_FAILED_CHANNEL, (event, message: unknown, documentId: unknown) => {
     assertTrustedMainWindowEvent(event)
     if (!isHarnessShellUrl(event.sender.getURL()) || typeof message !== 'string' || message.length > 20_000) {
       throw new Error('Invalid Harness boot failure report.')
+    }
+    if (!harnessBootFailures.isCurrent(documentId, mainWindowNavigationVersion)) {
+      runtime.note('[desktop] ignored a superseded Harness document boot failure')
+      return { ok: true, ignored: true }
     }
     return handleFrontendPluginFailure(message)
   })
@@ -3622,6 +3655,28 @@ async function bootstrap(): Promise<void> {
     locale: harnessLocale,
     crashEvidence: () => lastCrashEvidence,
     appVersion: () => app.getVersion()
+  })
+
+  const assertBrowserSender = (event: IpcMainInvokeEvent): void => {
+    assertTrustedMainWindowEvent(event)
+    const url = event.senderFrame?.url ?? ''
+    const backend = runtime.snapshot().url
+    let currentOrigin = false
+    try {
+      const frameUrl = new URL(url)
+      currentOrigin = backend !== undefined && frameUrl.origin === new URL(backend).origin
+        && frameUrl.username === '' && frameUrl.password === ''
+    }
+    catch { /* Invalid or absent frame URLs are not trusted. */ }
+    if (!isHarnessShellUrl(url) && !currentOrigin) throw new Error('Sidebar browser requires the active Harness page.')
+  }
+  ipcMain.handle(SIDEBAR_BROWSER_IPC.acquire, (event, workspace: unknown) => {
+    assertBrowserSender(event)
+    return sidebarBrowser.acquire(event.sender, workspace)
+  })
+  ipcMain.handle(SIDEBAR_BROWSER_IPC.release, async (event, lease: unknown) => {
+    assertBrowserSender(event)
+    await sidebarBrowser.release(event.sender, lease)
   })
 
   ipcMain.handle('directory-picker:open', async (event) => {
